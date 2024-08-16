@@ -2,34 +2,22 @@ import cv2
 import numpy as np
 from PIL import Image
 import tensorflow.lite as tflite
+import gradio as gr
+import math
 
 # Define key point indices based on the PoseNet model output
 NOSE = 0
-LEFT_EYE = 1
-RIGHT_EYE = 2
-LEFT_EAR = 3
-RIGHT_EAR = 4
 LEFT_SHOULDER = 5
 RIGHT_SHOULDER = 6
-LEFT_ELBOW = 7
-RIGHT_ELBOW = 8
-LEFT_WRIST = 9
-RIGHT_WRIST = 10
 LEFT_HIP = 11
 RIGHT_HIP = 12
-LEFT_KNEE = 13
-RIGHT_KNEE = 14
-LEFT_ANKLE = 15
-RIGHT_ANKLE = 16
 
 def load_model(model_path):
-    """Load TFLite model, returns an Interpreter instance."""
     interpreter = tflite.Interpreter(model_path=model_path)
     interpreter.allocate_tensors()
     return interpreter
 
 def process_image(interpreter, image, input_index):
-    """Process an image, Return a list of positions in a 4-Tuple (pos_x, pos_y, offset_x, offset_y)"""
     input_data = np.expand_dims(image, axis=0)
     input_data = (np.float32(input_data) - 127.5) / 127.5
 
@@ -53,7 +41,6 @@ def process_image(interpreter, image, input_index):
                     max_score = output_data[row][col][k]
                     max_row = row
                     max_col = col
-
         points.append((max_row, max_col))
 
     positions = []
@@ -66,7 +53,6 @@ def process_image(interpreter, image, input_index):
     return positions
 
 def display_result(positions, frame):
-    """Display Detected Points in circles"""
     size = 5
     color = (255, 0, 0)
     thickness = 3
@@ -80,42 +66,49 @@ def display_result(positions, frame):
         y = int(pos_y / 8 * height + offset_y)
         cv2.circle(frame, (x, y), size, color, thickness)
 
-    cv2.imshow('Pose Detection', frame)
+    return frame
+
+def calculate_angle(p1, p2):
+    delta_x = p2[0] - p1[0]
+    delta_y = p2[1] - p1[1]
+    angle = math.degrees(math.atan2(delta_y, delta_x))
+    return angle
 
 def is_bad_posture(positions):
-    """Analyze positions and return True if bad posture is detected, otherwise False"""
+    # Extract key points
     left_shoulder = positions[LEFT_SHOULDER]
     right_shoulder = positions[RIGHT_SHOULDER]
     left_hip = positions[LEFT_HIP]
     right_hip = positions[RIGHT_HIP]
-    nose = positions[NOSE]
 
-    # Calculate the average shoulder and hip height
-    shoulder_avg_y = (left_shoulder[1] + right_shoulder[1]) / 2
-    hip_avg_y = (left_hip[1] + right_hip[1]) / 2
+    # Calculate the midpoint of the shoulders and hips
+    shoulder_midpoint = (
+        (left_shoulder[0] + right_shoulder[0]) / 2,
+        (left_shoulder[1] + right_shoulder[1]) / 2
+    )
+    hip_midpoint = (
+        (left_hip[0] + right_hip[0]) / 2,
+        (left_hip[1] + right_hip[1]) / 2
+    )
 
-    # Calculate the vertical alignment of shoulders
-    shoulder_alignment = abs(left_shoulder[1] - right_shoulder[1])
+    # Calculate the trunk flexion angle
+    trunk_angle = calculate_angle(hip_midpoint, shoulder_midpoint)
 
-    # Calculate the vertical alignment of the back
-    back_alignment = abs(shoulder_avg_y - hip_avg_y)
+    # Normalize the trunk angle to the range [0, 180]
+    trunk_angle = abs(trunk_angle)
+    if trunk_angle > 90:
+        trunk_angle = 180 - trunk_angle
 
-    # Check if the head is too forward
-    head_forward = abs(nose[0] - ((left_shoulder[0] + right_shoulder[0]) / 2))
+    # Classify the trunk flexion angle
+    if trunk_angle <= 20:
+        return "Low-risk posture"
+    elif 20 < trunk_angle <= 60:
+        return "Medium-risk posture"
+    else:
+        return "High-risk posture"
 
-    # Define thresholds for bad posture detection
-    shoulder_alignment_threshold = 20  # Example value, adjust based on calibration
-    back_alignment_threshold = 30  # Example value, adjust based on calibration
-    head_forward_threshold = 50  # Example value, adjust based on calibration
-
-    if shoulder_alignment > shoulder_alignment_threshold or back_alignment > back_alignment_threshold or head_forward > head_forward_threshold:
-        return True
-    return False
-
-if __name__ == "__main__":
+def predict_posture(image):
     model_path = 'data/posenet_mobilenet_v1_100_257x257_multi_kpt_stripped.tflite'
-    image_path = 'data/bad_posture.jpg'
-
     interpreter = load_model(model_path)
 
     input_details = interpreter.get_input_details()
@@ -124,22 +117,29 @@ if __name__ == "__main__":
     width = input_shape[2]
     input_index = input_details[0]['index']
 
-    frame = cv2.imread(image_path, cv2.IMREAD_COLOR)
-    print(frame.shape)
+    frame = np.array(image)
+    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    resized_image = Image.fromarray(frame_rgb).resize((width, height))
+    positions = process_image(interpreter, np.array(resized_image), input_index)
 
-    image = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-    image = image.resize((width, height))
+    posture_risk = is_bad_posture(positions)
 
-    positions = process_image(interpreter, image, input_index)
+    if posture_risk != "Low-risk posture":
+        cv2.putText(frame, posture_risk, (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2, cv2.LINE_AA)
+    else:
+        cv2.putText(frame, posture_risk, (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2, cv2.LINE_AA)
 
-    # Check for bad posture
-    if is_bad_posture(positions):
-        print("Bad posture detected!")
-        # Add visual feedback on the image
-        cv2.putText(frame, "Bad Posture", (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2, cv2.LINE_AA)
+    result_image = display_result(positions, frame)
+    return result_image, posture_risk
 
-    display_result(positions, frame)
+# Gradio interface
+iface = gr.Interface(
+    fn=predict_posture,
+    inputs=gr.Image(type="numpy"),
+    outputs=[gr.Image(type="numpy"), gr.Text()],
+    title="Posture Detection",
+    description="Upload an image to detect if the posture is low, medium, or high-risk."
+)
 
-    key = cv2.waitKey(0)
-    if key == 27:  # esc
-        cv2.destroyAllWindows()
+if __name__ == "__main__":
+    iface.launch()
